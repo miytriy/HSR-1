@@ -96,4 +96,29 @@ export interface InterruptAction {
   name: string;
   action: () => void;
 }
+// --- 既存の型定義が上にある状態 ---
+
+// EP計算や行動定義で新しく使う型を追加・統合
+export type ActionType = "basic_attack" | "skill" | "ultimate" | "hit" | "kill" | "talent";
+
+export interface EpGainContext {
+  actionType: ActionType;
+  baseEp: number;
+  applyRecoveryRate?: boolean; // EP回復効率を適用するか（デフォルト: true）
+}
+
+// 既存の CombatStats がある場合は、ep や energyRecoveryRate をプロパティに追加/更新してください
+export interface CombatStats {
+  hp: number;
+  maxHp: number;
+  atk: number;
+  def: number;
+  spd: number;
+  ep: number;                  // 現在のEP
+  maxEp: number;               // 最大EP (例: フォフォは 140)
+  energyRecoveryRate: number;  // EP回復効率 (0.194 = 19.4%)
+  cr: number;                  // 会心率
+  cd: number;                  // 会心ダメージ
+  lv: number;                  // レベル
+}
 
