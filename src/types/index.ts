@@ -54,7 +54,7 @@ export interface SkillContext {
 }
 
 export interface BreakContext extends SkillContext {
-  breakpointDamageBase: number;
+  breakpointDamageBase?: number; // ← ここに「?」を追加して省略可能（任意）に修正！
   breakSpecialEffect?: number;
   toughness?: number;
   enemyType?: EnemyType;
