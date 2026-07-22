@@ -1,23 +1,28 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  ダメージ計算エンジン
+ *  ダメージ計算エンジン（属性・状態異常統合版）
  *
  *  構成:
  *    1. 基礎ダメージ計算 (normalDamage)
  *    2. 付加ダメージ計算 (additionalDamage)
  *    3. 持続ダメージ計算 (dotDamage)
- *    4. 弱点撃破ダメージ計算 (breakpointDamage)
+ *    4. 弱点撃破ダメージ計算 + 自動付与 (breakpointDamage)
  *    5. 係数群 (会心・与ダメ・防御・属性耐性・被ダメ・撃破)
  *
- *  使用例:
- *    const attacker = { atk: 2000, cr: 0.8, cd: 3.0, ... };
- *    const defender = { def: 400, lv: 80, elementResist: 0.2, ... };
- *    const skillRatio = 1.2;  // 軌跡倍率
- *
- *    const dmg = normalDamage(attacker, defender, skillRatio, 80);
- *    console.log(`期待値ダメージ: ${dmg.expected}`);
+ *  弱点撃破時の状態異常自動付与:
+ *    属性 → 状態異常 の自動マッピング
+ *    物理 → 裂創
+ *    炎 → 燃焼
+ *    氷 → 凍結
+ *    雷 → 感電
+ *    風 → 風化
+ *    量子 → もつれ
+ *    虚数 → 禁錮
  * ═══════════════════════════════════════════════════════════════════════════
  */
+
+import type { Element, StatusEffect, EnemyType, StatusEffectStack } from "./elementSystem";
+import { ELEMENT_STATUS_MAP, STATUS_EFFECT_DEFINITIONS, calcStatusEffectDamageBase } from "./elementSystem";
 
 // ── タイプ定義 ──
 
@@ -43,11 +48,16 @@ export interface SkillContext {
   receiveDamageBonus?: number;         // 被ダメージボーナス (0.0 ~ 1.0)
   elementBonus?: number;               // 属性別与ダメージ (0.0 ~ 1.0)
   crit?: boolean;                      // 強制会心 (true時は必ず会心)
+  element?: Element;                   // 攻撃属性（弱点撃破時の状態異常決定用）
+  defenderResistance?: number;         // 敵の属性耐性
 }
 
 export interface BreakContext extends SkillContext {
   breakpointDamageBase: number;        // 弱点撃破ダメージ基礎値
   breakSpecialEffect?: number;         // 撃破特効 (0.0 ~ 1.0)
+  toughness?: number;                  // 靭性係数（デフォルト1.0）
+  enemyType?: EnemyType;               // 敵のタイプ（通常・精鋭・ボス）
+  defenderMaxHp?: number;              // 敵の最大HP（状態異常計算用）
 }
 
 export interface DamageResult {
@@ -63,6 +73,15 @@ export interface DamageResult {
   breakpoint: number;                  // 撃破係数 (0.9 or 1.0)
   actual: number;                      // 実ダメージ (会心時)
   expected: number;                    // 期待値ダメージ
+}
+
+/**
+ * 弱点撃破の結果（ダメージ + 状態異常付与情報）
+ */
+export interface BreakpointResult {
+  damage: DamageResult;                // ダメージ計算結果
+  statusEffect: StatusEffect | null;   // 自動付与される状態異常（nullの場合は付与なし）
+  statusEffectStack?: StatusEffectStack; // 付与される状態異常のスタック情報
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -219,6 +238,7 @@ export function normalDamage(
     receiveDamageBonus = 0,
     elementBonus = 0,
     crit: forceCrit = false,
+    defenderResistance = 0,
   } = skillContext;
 
   // 1. ダメージ基礎値
@@ -241,7 +261,7 @@ export function normalDamage(
 
   // 5. 属性耐性係数
   const resistanceCoeff = calcResistanceCoefficient(
-    0, // defender の属性耐性は context で渡す想定
+    defenderResistance,
     resistancePenetration
   );
 
@@ -343,6 +363,7 @@ export function dotDamage(
     resistancePenetration = 0,
     receiveDamageBonus = 0,
     elementBonus = 0,
+    defenderResistance = 0,
   } = skillContext;
 
   // 1. ダメージ基礎値（ダメージ発生時のステータスで計算）
@@ -364,7 +385,7 @@ export function dotDamage(
   );
 
   // 5. 属性耐性係数
-  const resistanceCoeff = calcResistanceCoefficient(0, resistancePenetration);
+  const resistanceCoeff = calcResistanceCoefficient(defenderResistance, resistancePenetration);
 
   // 6. 被ダメージ係数
   const receiveDamageCoeff = calcReceiveDamageCoefficient(receiveDamageBonus);
@@ -399,27 +420,31 @@ export function dotDamage(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  弱点撃破ダメージ計算
+//  弱点撃破ダメージ計算 + 自動付与
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * 弱点撃破ダメージを計算
+ * 弱点撃破ダメージを計算して、属性に応じた状態異常を自動付与
  *
- * 弱点撃破ダメージ = 弱点撃破ダメージ基礎値 × (1 + 撃破特効) × 防御係数 ×
- *                  属性耐性係数 × 被ダメージ係数 × 撃破係数
+ * 属性 → 状態異常 のマッピング:
+ *   物理 → 裂創
+ *   炎 → 燃焼
+ *   氷 → 凍結
+ *   雷 → 感電
+ *   風 → 風化
+ *   量子 → もつれ
+ *   虚数 → 禁錮
  *
- * 撃破係数は 1.0（弱点撃破状態）を使用。
- *
- * @param breakContext 弱点撃破のコンテキスト
  * @param attacker 攻撃者のステータス
  * @param defender 防御者のステータス
- * @returns ダメージ結果
+ * @param breakContext 弱点撃破のコンテキスト
+ * @returns ダメージ + 自動付与される状態異常
  */
 export function breakpointDamage(
   attacker: CombatStats,
   defender: CombatStats,
   breakContext: BreakContext = {}
-): DamageResult {
+): BreakpointResult {
   const {
     breakpointDamageBase,
     breakSpecialEffect = 0,
@@ -428,6 +453,11 @@ export function breakpointDamage(
     resistancePenetration = 0,
     receiveDamageBonus = 0,
     elementBonus = 0,
+    defenderResistance = 0,
+    element,
+    toughness = 1.0,
+    enemyType = "normal",
+    defenderMaxHp = 0,
   } = breakContext;
 
   // 1. 弱点撃破ダメージ基礎値 × (1 + 撃破特効)
@@ -449,7 +479,7 @@ export function breakpointDamage(
   );
 
   // 5. 属性耐性係数
-  const resistanceCoeff = calcResistanceCoefficient(0, resistancePenetration);
+  const resistanceCoeff = calcResistanceCoefficient(defenderResistance, resistancePenetration);
 
   // 6. 被ダメージ係数
   const receiveDamageCoeff = calcReceiveDamageCoefficient(receiveDamageBonus);
@@ -467,7 +497,7 @@ export function breakpointDamage(
     breakpointCoeff
   );
 
-  return {
+  const damageResult: DamageResult = {
     base: damageBase,
     crit: {
       coefficient: critCoeff,
@@ -480,6 +510,48 @@ export function breakpointDamage(
     breakpoint: breakpointCoeff,
     actual: actualDamage,
     expected: actualDamage,
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  //  属性から状態異常を自動決定して付与
+  // ─────────────────────────────────────────────────────────────
+
+  let statusEffect: StatusEffect | null = null;
+  let statusEffectStack: StatusEffectStack | undefined;
+
+  if (element) {
+    // 属性 → 状態異常のマッピング
+    statusEffect = ELEMENT_STATUS_MAP[element];
+
+    if (statusEffect) {
+      // 状態異常のダメージ基礎値を計算
+      const statusEffectBase = calcStatusEffectDamageBase(
+        statusEffect,
+        attacker.lv,
+        defenderMaxHp,
+        1, // 初期スタック数は1（風化の敵タイプ別は別途呼び出し時に調整）
+        enemyType,
+        toughness
+      );
+
+      // 状態異常スタック情報を構築
+      const effectDef = STATUS_EFFECT_DEFINITIONS[statusEffect];
+      statusEffectStack = {
+        effect: statusEffect,
+        stacks: 1, // 初期値は1（風化の場合は呼び出し元で調整）
+        turnsRemaining: effectDef.duration,
+        appliedBy: {
+          charLevel: attacker.lv,
+          breakEffect: breakSpecialEffect,
+        },
+      };
+    }
+  }
+
+  return {
+    damage: damageResult,
+    statusEffect,
+    statusEffectStack,
   };
 }
 
@@ -505,6 +577,18 @@ export function formatDamageResult(result: DamageResult, label: string = ""): st
   ].filter(Boolean);
 
   return lines.join("\n");
+}
+
+/**
+ * 弱点撃破結果を整形表示
+ */
+export function formatBreakpointResult(result: BreakpointResult, label: string = ""): string {
+  const damageText = formatDamageResult(result.damage, label || "弱点撃破");
+  const statusText = result.statusEffect
+    ? `\n  【自動付与状態異常】\n    状態異常: ${STATUS_EFFECT_DEFINITIONS[result.statusEffect].name}\n    持続ターン: ${result.statusEffectStack?.turnsRemaining ?? 0}T`
+    : "\n  【状態異常】付与なし";
+
+  return damageText + statusText;
 }
 
 /**
